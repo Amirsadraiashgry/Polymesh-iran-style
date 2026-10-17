@@ -23,13 +23,12 @@ use codec::{Decode, Encode};
 use frame_support::dispatch::{
     DispatchResultWithPostInfo, GetDispatchInfo, PostDispatchInfo, RawOrigin,
 };
-use frame_support::traits::{Contains, Get, GetCallMetadata, IsType};
+use frame_support::traits::{CallMetadata, Contains, Get, GetCallMetadata, IsType};
 use frame_support::weights::Weight;
 use frame_system::pallet_prelude::OriginFor;
 use sp_runtime::traits::Dispatchable;
 use sp_runtime::DispatchError;
 
-use pallet_permissions::with_call_metadata;
 use pallet_revive::precompiles::alloy::primitives::{Address, IntoLogData, U256};
 use pallet_revive::precompiles::alloy::sol_types::Revert;
 use pallet_revive::precompiles::{AddressMapper, Error, Ext, RuntimeCosts, H256};
@@ -48,6 +47,7 @@ pub const ERR_BALANCE_CONVERSION_FAILED: &str = "Balance conversion failed";
 pub const ERR_EXTRINSIC_ERROR: &str = "Extrinsic returned an error: ";
 pub const ERR_INVALID_ACCOUNT_ID: &str = "Invalid account id";
 pub const ERR_ASSET_NOT_FOUND: &str = "Asset not found";
+pub const ERR_WEIGHT_LIMIT_EXCEEDED: &str = "Benchmarked weight limit exceeded";
 pub const ERR_INST_NOT_EXECUTED: &str = "Instruction was not executed; Most likely the instruction is missing an affirmation from the receiver/mediator";
 const ERR_ASSET_NOT_FUNGIBLE: &str = "Asset is not fungible";
 const ERR_ASSET_NOT_NON_FUNGIBLE: &str = "Asset is not non-fungible";
@@ -105,7 +105,28 @@ pub fn extrinsic_error(err: impl Into<DispatchError>) -> Error {
 
 /// Weight of swapping the current call metadata in and back out again.
 pub fn call_metadata_weight<T: frame_system::Config>() -> Weight {
-    <T as frame_system::Config>::DbWeight::get().reads_writes(2, 4)
+    <T as frame_system::Config>::DbWeight::get().reads_writes(3, 6)
+}
+
+/// Dispatch `tx` with the given call `metadata`, setting `payer` as the current fee payer for
+/// the duration of the call.
+fn with_call_metadata<T, R>(
+    metadata: CallMetadata,
+    payer: Option<T::AccountId>,
+    tx: impl FnOnce() -> R,
+) -> R
+where
+    T: pallet_permissions::Config + polymesh_transaction_payment::Config,
+{
+    // Hold the original value for payer and temporarily change it
+    let original_payer = polymesh_transaction_payment::Pallet::<T>::current_payer();
+    polymesh_transaction_payment::Pallet::<T>::set_current_payer(payer);
+
+    let call_result = pallet_permissions::with_call_metadata::<T, _>(metadata, tx);
+
+    // Restore the original payer
+    polymesh_transaction_payment::Pallet::<T>::set_current_payer(original_payer);
+    call_result
 }
 
 /// Dispatches runtime calls with the call metadata of the call being dispatched.
@@ -118,7 +139,7 @@ pub struct DispatchWithCallMetadata<T>(PhantomData<T>);
 impl<T> DispatchRuntimeCall<<T as pallet_revive::Config>::RuntimeCall>
     for DispatchWithCallMetadata<T>
 where
-    T: pallet_revive::Config + pallet_permissions::Config,
+    T: pallet_revive::Config + pallet_permissions::Config + polymesh_transaction_payment::Config,
     <T as pallet_revive::Config>::RuntimeCall: GetCallMetadata,
 {
     fn weight() -> Weight {
@@ -129,7 +150,8 @@ where
         call: <T as pallet_revive::Config>::RuntimeCall,
         origin: OriginFor<T>,
     ) -> DispatchResultWithPostInfo {
-        with_call_metadata::<T, _>(call.get_call_metadata(), || call.dispatch(origin))
+        let payer = frame_system::ensure_signed(origin.clone()).ok();
+        with_call_metadata::<T, _>(call.get_call_metadata(), payer, || call.dispatch(origin))
     }
 }
 
@@ -352,7 +374,7 @@ impl<T: Config> Common<T> {
         Ok(())
     }
 
-    /// Dispatch a runtime `call` on behalf of `origin`.
+    /// Dispatch a runtime `call` on behalf of `origin`, with `payer` set as the current fee payer.
     ///
     /// The call is dispatched with its own call metadata, so that the secondary key permissions
     /// of the caller are checked against the extrinsic being called and not against the
@@ -360,6 +382,7 @@ impl<T: Config> Common<T> {
     pub fn call_runtime(
         env: &mut impl Ext<T = T>,
         origin: OriginFor<T>,
+        payer: T::AccountId,
         call: impl Into<CallOf<T>>,
     ) -> Result<PostDispatchInfo, Error> {
         let call: CallOf<T> = call.into();
@@ -367,7 +390,9 @@ impl<T: Config> Common<T> {
         let dispatch_info = call.get_dispatch_info();
         let charged = env.charge(dispatch_info.call_weight.saturating_add(metadata_weight))?;
 
-        let result = with_call_metadata::<T, _>(call.get_call_metadata(), || call.dispatch(origin));
+        let result = with_call_metadata::<T, _>(call.get_call_metadata(), Some(payer), || {
+            call.dispatch(origin)
+        });
 
         let (post_info, error) = match result {
             Ok(post_info) => (post_info, None),
@@ -392,6 +417,7 @@ impl<T: Config> Common<T> {
     /// extrinsic's `PostDispatchInfo`; `f` is responsible for charging the weight it uses.
     pub fn with_runtime_call<R>(
         env: &mut impl Ext<T = T>,
+        payer: T::AccountId,
         call: impl Into<CallOf<T>>,
         f: impl FnOnce() -> R,
     ) -> Result<R, Error> {
@@ -402,6 +428,10 @@ impl<T: Config> Common<T> {
             return Err(extrinsic_error(frame_system::Error::<T>::CallFiltered));
         }
 
-        Ok(with_call_metadata::<T, _>(call.get_call_metadata(), f))
+        Ok(with_call_metadata::<T, _>(
+            call.get_call_metadata(),
+            Some(payer),
+            f,
+        ))
     }
 }

@@ -11,9 +11,10 @@ use pallet_sto::{
 };
 use polymesh_primitives::asset::AssetId;
 use polymesh_primitives::checked_inc::CheckedInc;
+use polymesh_primitives::crypto::{ChainScopedMessage, STO_FUNDRAISER_RECEIPT_LABEL};
 use polymesh_primitives::settlement::{InstructionStatus, VenueDetails, VenueId, VenueType};
-use polymesh_primitives::sto::FundraiserId;
-use polymesh_primitives::{IdentityId, PortfolioId, WeightMeter};
+use polymesh_primitives::sto::{FundraiserId, FundraiserReceipt, FundraiserReceiptDetails};
+use polymesh_primitives::{IdentityId, PortfolioId, Ticker, WeightMeter};
 
 use crate::asset_pallet::setup::create_and_issue_sample_asset;
 
@@ -47,6 +48,16 @@ fn raise_happy_path_ext() {
 #[test]
 fn raise_unhappy_path_ext() {
     test(raise_unhappy_path);
+}
+
+#[test]
+fn invest_with_asset_mediator_ext() {
+    test(invest_with_asset_mediator);
+}
+
+#[test]
+fn invest_with_offchain_funding_ext() {
+    test(invest_with_offchain_funding);
 }
 
 #[test]
@@ -683,5 +694,174 @@ fn stop_fundraiser() {
     assert_noop!(
         Sto::stop(alice.origin(), offering_asset, fundraiser_id,),
         Error::FundraiserClosed
+    );
+}
+
+fn invest_with_asset_mediator() {
+    let RaiseContext {
+        alice,
+        alice_portfolio,
+        bob,
+        bob_portfolio,
+        offering_asset,
+        raise_asset,
+    } = init_raise_context();
+    let raise_asset = raise_asset.unwrap();
+
+    let charlie = User::new(Sr25519Keyring::Charlie);
+    exec_ok!(Asset::add_mandatory_mediators(
+        alice.origin(),
+        offering_asset,
+        BTreeSet::from([charlie.did]).try_into().unwrap(),
+    ));
+
+    let mut weight_meter = WeightMeter::max_limit_no_minimum();
+    assert_ok!(Asset::unverified_transfer_asset(
+        alice_portfolio.clone().into(),
+        bob_portfolio.clone().into(),
+        raise_asset,
+        1_000_000,
+        None,
+        None,
+        IdentityId::default(),
+        false,
+        &mut weight_meter
+    ));
+
+    let venue_counter = VenueCounter::<TestStorage>::get();
+    exec_ok!(Settlement::create_venue(
+        alice.origin(),
+        VenueDetails::default(),
+        BTreeSet::from([Sr25519Keyring::Alice.to_account_id()]),
+        VenueType::Sto
+    ));
+
+    let fundraiser_id = FundraiserCount::<TestStorage>::get(offering_asset);
+    exec_ok!(Sto::create_fundraiser(
+        alice.origin(),
+        alice_portfolio.clone(),
+        offering_asset,
+        alice_portfolio.clone(),
+        raise_asset,
+        vec![PriceTier {
+            total: 1_000_000u128,
+            price: 1_000_000u128,
+        }],
+        venue_counter,
+        None,
+        None,
+        0,
+        FundraiserName::default(),
+    ));
+
+    let amount = 100u128;
+    let instruction_id = InstructionCounter::<TestStorage>::get();
+
+    // Bob invests in Alice's fundraiser. Because the offering asset has a mandatory
+    // mediator, the settlement instruction is created and affirmed by both parties,
+    // but stays pending settlement until the mediator affirms it too.
+    assert_noop!(
+        Sto::invest(
+            bob.origin(),
+            offering_asset,
+            fundraiser_id,
+            bob_portfolio.clone(),
+            FundingMethod::OnChain(bob_portfolio.clone()),
+            amount.into(),
+            Some(1_000_000u128),
+        ),
+        Error::InstructionNotSettled
+    );
+
+    assert_eq!(
+        InstructionStatuses::<TestStorage>::get(instruction_id),
+        InstructionStatus::Unknown
+    );
+}
+
+fn invest_with_offchain_funding() {
+    let RaiseContext {
+        alice,
+        alice_portfolio,
+        bob,
+        bob_portfolio,
+        offering_asset,
+        raise_asset,
+    } = init_raise_context();
+
+    let venue_counter = VenueCounter::<TestStorage>::get();
+    exec_ok!(Settlement::create_venue(
+        alice.origin(),
+        VenueDetails::default(),
+        BTreeSet::from([Sr25519Keyring::Alice.to_account_id()]),
+        VenueType::Sto
+    ));
+
+    let fundraiser_id = FundraiserCount::<TestStorage>::get(offering_asset);
+    exec_ok!(Sto::create_fundraiser(
+        alice.origin(),
+        alice_portfolio.clone(),
+        offering_asset,
+        alice_portfolio.clone(),
+        raise_asset.unwrap(),
+        vec![PriceTier {
+            total: 1_000_000u128,
+            price: 1_000_000u128,
+        }],
+        venue_counter,
+        None,
+        None,
+        0,
+        FundraiserName::default(),
+    ));
+
+    let ticker = Ticker::from_slice_truncated(b"OFFCHAIN");
+    exec_ok!(Sto::enable_offchain_funding(
+        alice.origin(),
+        offering_asset,
+        fundraiser_id,
+        ticker,
+    ));
+
+    // Bob has nothing to affirm: his portfolio is the receiver and there is no on-chain funding leg
+    let (uid, expires_at, amount) = (0, 1_000_000u64, 100u128);
+    let message = ChainScopedMessage::<TestStorage, _>::new_unchecked(
+        uid,
+        STO_FUNDRAISER_RECEIPT_LABEL,
+        expires_at,
+        FundraiserReceipt::new(fundraiser_id, bob.did, alice.did, ticker, amount),
+    );
+    let receipt_details = FundraiserReceiptDetails::new(
+        uid,
+        Sr25519Keyring::Alice.to_account_id(),
+        message
+            .sign(&Sr25519Keyring::Alice)
+            .expect("Failed to sign message")
+            .into(),
+        expires_at,
+        None,
+    );
+
+    let instruction_id = InstructionCounter::<TestStorage>::get();
+    exec_ok!(Sto::invest(
+        bob.origin(),
+        offering_asset,
+        fundraiser_id,
+        bob_portfolio.clone(),
+        FundingMethod::OffChain(receipt_details),
+        amount,
+        Some(1_000_000u128),
+    ));
+
+    assert!(matches!(
+        InstructionStatuses::<TestStorage>::get(instruction_id),
+        InstructionStatus::Success(_)
+    ));
+    assert_eq!(
+        Fundraisers::<TestStorage>::get(offering_asset, fundraiser_id)
+            .unwrap()
+            .tiers[0]
+            .remaining,
+        1_000_000 - amount
     );
 }

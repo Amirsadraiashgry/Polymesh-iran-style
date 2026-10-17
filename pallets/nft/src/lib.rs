@@ -47,6 +47,8 @@ pub trait WeightInfo {
     fn approve() -> Weight;
     fn set_approval_for_all() -> Weight;
     fn spend_nft_approval(n: u32) -> Weight;
+    fn nft_transfer_report_best_case() -> Weight;
+    fn nft_transfer_report_worst_case() -> Weight;
 }
 
 pub use pallet::*;
@@ -116,6 +118,22 @@ pub mod pallet {
             spender: AccountId32,
             asset_id: AssetId,
             nft_id: NFTId,
+        },
+        /// An agent forced the transfer of NFTs from `source` to one of the caller's holdings,
+        /// via `controller_transfer`.
+        ControllerTransfer {
+            caller_did: IdentityId,
+            nfts: NFTs,
+            source: AssetHolder,
+            destination: AssetHolder,
+        },
+        /// An agent forced the transfer of NFTs from `source` to an arbitrary `destination`,
+        /// via `controller_transfer_to`.
+        ControllerTransferTo {
+            caller_did: IdentityId,
+            nfts: NFTs,
+            source: AssetHolder,
+            destination: AssetHolder,
         },
     }
 
@@ -301,6 +319,7 @@ pub mod pallet {
         /// - `CollectionNotFound` - if the collection associated to the given asset_id has not been created.
         /// - `InvalidMetadataAttribute` - if the number of attributes is not equal to the number set in the collection or attempting to set a value for a key not definied in the collection.
         /// - `DuplicateMetadataKey` - if a duplicate metadata keys has been passed as input.
+        /// - `AssetMetadataValueMaxLengthExceeded` - if any metadata value exceeds `AssetMetadataValueMaxLength`.
         ///
         ///
         /// # Permissions
@@ -679,11 +698,12 @@ impl<T: Config> Pallet<T> {
             Error::<T>::DuplicateMetadataKey
         );
 
-        for metadata_key in nft_attributes.keys() {
+        for (metadata_key, metadata_value) in nft_attributes.iter() {
             ensure!(
                 mandatory_keys.contains(metadata_key),
                 Error::<T>::InvalidMetadataAttribute
             );
+            AssetPallet::<T>::ensure_asset_metadata_value_limited(metadata_value)?;
         }
 
         // Mints the NFT and adds it to the caller's portfolio
@@ -755,13 +775,15 @@ impl<T: Config> Pallet<T> {
         NumberOfNFTs::<T>::insert(&asset_id, &holder_did, new_balance);
         Self::remove_nft_from_asset_holder(&asset_id, &nft_id, &caller_holding)?;
 
-        let removed_keys = MetadataValue::<T>::drain_prefix((&collection_id, &nft_id)).count();
+        let n_collection_keys = CollectionKeys::<T>::get(&collection_id).len();
         if let Some(number_of_keys) = number_of_keys {
             ensure!(
-                usize::from(number_of_keys) >= removed_keys,
+                usize::from(number_of_keys) >= n_collection_keys,
                 Error::<T>::NumberOfKeysIsLessThanExpected,
             );
         }
+
+        let _ = MetadataValue::<T>::clear_prefix((&collection_id, &nft_id), u32::MAX, None);
 
         Self::deposit_event(Event::NFTHoldingsUpdated(
             holder_did,
@@ -771,7 +793,7 @@ impl<T: Config> Pallet<T> {
             HoldingsUpdateReason::Redeemed,
         ));
         Ok(PostDispatchInfo::from(Some(
-            <T as Config>::WeightInfo::redeem_nft(removed_keys as u32),
+            <T as Config>::WeightInfo::redeem_nft(n_collection_keys as u32),
         )))
     }
 
@@ -1119,11 +1141,17 @@ impl<T: Config> Pallet<T> {
 
         Self::deposit_event(Event::NFTHoldingsUpdated(
             holder_did,
-            nfts,
-            Some(source),
-            Some(destination),
+            nfts.clone(),
+            Some(source.clone()),
+            Some(destination.clone()),
             HoldingsUpdateReason::ControllerTransfer,
         ));
+        Self::deposit_event(Event::ControllerTransfer {
+            caller_did: holder_did,
+            nfts,
+            source,
+            destination,
+        });
         Ok(())
     }
 
@@ -1170,11 +1198,17 @@ impl<T: Config> Pallet<T> {
 
         Self::deposit_event(Event::NFTHoldingsUpdated(
             caller_data.primary_did,
-            nfts,
-            Some(source),
-            Some(destination),
+            nfts.clone(),
+            Some(source.clone()),
+            Some(destination.clone()),
             HoldingsUpdateReason::ControllerTransfer,
         ));
+        Self::deposit_event(Event::ControllerTransferTo {
+            caller_did: caller_data.primary_did,
+            nfts,
+            source,
+            destination,
+        });
         Ok(())
     }
 
@@ -1226,6 +1260,12 @@ impl<T: Config> Pallet<T> {
         }
 
         if let Err(e) = Self::ensure_no_duplicate_nfts(nfts) {
+            nft_transfer_errors.push(e);
+        }
+
+        if let Err(e) =
+            pallet_asset::Pallet::<T>::ensure_holder_is_not_frozen(sender, nfts.asset_id())
+        {
             nft_transfer_errors.push(e);
         }
 
@@ -1471,6 +1511,7 @@ impl<T: Config> Pallet<T> {
             !Self::is_nft_locked(&asset_id, &nft_id, &asset_holder),
             Error::<T>::NFTIsLocked
         );
+        pallet_asset::Pallet::<T>::ensure_holder_is_not_frozen(&asset_holder, &asset_id)?;
 
         match asset_holder {
             AssetHolder::Account(acc_id) => {

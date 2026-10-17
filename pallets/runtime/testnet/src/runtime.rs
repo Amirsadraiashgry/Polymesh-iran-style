@@ -59,7 +59,7 @@ pub const VERSION: RuntimeVersion = RuntimeVersion {
     authoring_version: 1,
     // `spec_version: aaa_bbb_ccd` should match node version v`aaa.bbb.cc`
     // N.B. `d` is unpinned from the binary version
-    spec_version: 8_001_010,
+    spec_version: 8_001_030,
     impl_version: 0,
     apis: RUNTIME_API_VERSIONS,
     transaction_version: 8,
@@ -120,7 +120,7 @@ parameter_types! {
     pub const MaxMultiSigSigners: u32 = 50;
 
     // I'm online:
-    pub const ImOnlineUnsignedPriority: TransactionPriority = TransactionPriority::max_value();
+    pub const ImOnlineUnsignedPriority: TransactionPriority = TransactionPriority::MAX;
 
     pub const MaxSetIdSessionEntries: u32 = BondingDuration::get() * SessionsPerEra::get();
     pub const MaxAuthorities: u32 = 100_000;
@@ -137,6 +137,8 @@ parameter_types! {
 
     // Compliance manager:
     pub const MaxConditionComplexity: u32 = 50;
+    pub const MaximumNumberOfTrustedIssuers: u32 = 8;
+    pub const MaxTrustedIssuerClaimTypes: u32 = 16;
 
     // Corporate Actions:
     pub const MaxTargetIds: u32 = 1000;

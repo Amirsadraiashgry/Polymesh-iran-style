@@ -1310,7 +1310,7 @@ fn cross_identity_nft_transfer_when_portfolio_is_frozen() {
                 AssetHolder::Account(bob.acc()),
                 non_fungible_fund(asset_id, NFTId(1)),
             ),
-            SettlementError::FailedAssetTransferringConditions
+            AssetError::InvalidTransferSenderIsFrozen
         );
     });
 }
@@ -1348,6 +1348,44 @@ fn same_identity_nft_transfer_when_portfolio_is_frozen() {
                 non_fungible_fund(asset_id, NFTId(1)),
             ),
             AssetError::InvalidTransferSenderIsFrozen
+        );
+    });
+}
+
+#[test]
+fn same_identity_transfer_to_nonexistent_portfolio_rejected() {
+    ExtBuilder::default().build().execute_with(|| {
+        let alice = User::new(Sr25519Keyring::Alice);
+        let asset_id = create_and_issue_to_account(&alice);
+        let invalid_portfolio = PortfolioId::user_portfolio(alice.did, PortfolioNumber(10));
+
+        assert_noop!(
+            Settlement::transfer_funds(
+                alice.origin(),
+                None,
+                invalid_portfolio.into(),
+                fungible_fund(asset_id, 100),
+            ),
+            PortfolioError::PortfolioDoesNotExist
+        );
+    });
+}
+
+#[test]
+fn same_identity_nft_transfer_to_nonexistent_portfolio_rejected() {
+    ExtBuilder::default().build().execute_with(|| {
+        let alice = User::new(Sr25519Keyring::Alice);
+        let asset_id = create_and_issue_nft_to_account(&alice);
+        let invalid_portfolio = PortfolioId::user_portfolio(alice.did, PortfolioNumber(10));
+
+        assert_noop!(
+            Settlement::transfer_funds(
+                alice.origin(),
+                None,
+                invalid_portfolio.into(),
+                non_fungible_fund(asset_id, NFTId(1)),
+            ),
+            PortfolioError::PortfolioDoesNotExist
         );
     });
 }

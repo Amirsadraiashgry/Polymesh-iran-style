@@ -3167,7 +3167,10 @@ impl<T: AssetConfig> Pallet<T> {
             Error::<T>::UnexpectedNonFungibleToken
         );
 
-        if let AssetHolder::Portfolio(receiver_portfolio_id) = &asset_holder {
+        // Clearing the frozen amount is always allowed for accounts, so stale entries can be removed.
+        if amount > 0 {
+            Self::ensure_valid_holder(&asset_holder)?;
+        } else if let AssetHolder::Portfolio(receiver_portfolio_id) = &asset_holder {
             PortfolioPallet::<T>::ensure_portfolio_validity(receiver_portfolio_id)?;
         }
 
@@ -3258,6 +3261,7 @@ impl<T: AssetConfig> Pallet<T> {
             }
             AssetHolder::Account(account) => {
                 if freeze {
+                    Self::ensure_valid_holder(&holder)?;
                     FrozenAccounts::<T>::insert(account.clone(), asset_id, true);
                 } else {
                     FrozenAccounts::<T>::remove(account, &asset_id);
@@ -3525,7 +3529,7 @@ impl<T: AssetConfig> Pallet<T> {
     }
 
     /// Ensure asset metadata `value` is within the global limit.
-    fn ensure_asset_metadata_value_limited(value: &AssetMetadataValue) -> DispatchResult {
+    pub fn ensure_asset_metadata_value_limited(value: &AssetMetadataValue) -> DispatchResult {
         ensure!(
             value.len() <= T::AssetMetadataValueMaxLength::get() as usize,
             Error::<T>::AssetMetadataValueMaxLengthExceeded
@@ -3740,8 +3744,15 @@ impl<T: AssetConfig> Pallet<T> {
             }
         }
 
+        if let Err(e) = Self::ensure_holder_is_not_frozen(sender, asset_id) {
+            asset_transfer_errors.push(e);
+        }
+
         if skip_locked_check {
-            if Self::get_holders_balance(sender, asset_id) < transfer_value {
+            let frozen_balance = Self::get_holders_frozen_balance(sender, asset_id);
+            let current_balance = Self::get_holders_balance(sender, asset_id);
+
+            if current_balance.saturating_sub(frozen_balance) < transfer_value {
                 asset_transfer_errors.push(Error::<T>::InsufficientBalance.into());
             }
         } else {

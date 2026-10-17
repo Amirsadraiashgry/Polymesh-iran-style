@@ -70,7 +70,8 @@ pub mod benchmarking;
 use codec::{Decode, Encode};
 use core::convert::From;
 use frame_support::dispatch::{
-    DispatchResult, DispatchResultWithPostInfo, GetDispatchInfo, PostDispatchInfo,
+    DispatchErrorWithPostInfo, DispatchResult, DispatchResultWithPostInfo, GetDispatchInfo,
+    PostDispatchInfo,
 };
 use frame_support::pallet_prelude::DispatchError;
 use frame_support::traits::{Get, GetCallMetadata, IsSubType, UnfilteredDispatchable};
@@ -82,6 +83,7 @@ use sp_std::convert::TryFrom;
 use sp_std::prelude::*;
 
 use pallet_identity::Config as IdentityConfig;
+use pallet_identity::WeightInfo as IdentityWeightInfo;
 use pallet_permissions::with_call_metadata;
 use polymesh_primitives::multisig::{ProposalState, ProposalVoteCount};
 use polymesh_primitives::{
@@ -94,6 +96,7 @@ pub trait WeightInfo {
     fn create_proposal() -> Weight;
     fn approve() -> Weight;
     fn execute_proposal() -> Weight;
+    fn decode_proposal() -> Weight;
     fn reject() -> Weight;
     fn accept_multisig_signer() -> Weight;
     fn add_multisig_signers(signers: u32) -> Weight;
@@ -120,6 +123,7 @@ pub trait WeightInfo {
 
     fn approve_and_execute(max_weight: &Option<Weight>) -> Weight {
         Self::approve()
+            .saturating_add(Self::decode_proposal())
             .saturating_add(Self::execute_proposal())
             .saturating_add(Self::default_max_weight(max_weight))
     }
@@ -198,13 +202,13 @@ pub mod pallet {
                 TransactionVersion::<T>::set(current_version);
                 // TODO: Multiblock migration.
                 let mut removed = 0;
-                let res = Proposals::<T>::clear(u32::max_value(), None);
+                let res = Proposals::<T>::clear(u32::MAX, None);
                 removed += res.unique;
-                let res = ProposalVoteCounts::<T>::clear(u32::max_value(), None);
+                let res = ProposalVoteCounts::<T>::clear(u32::MAX, None);
                 removed += res.unique;
-                let res = ProposalStates::<T>::clear(u32::max_value(), None);
+                let res = ProposalStates::<T>::clear(u32::MAX, None);
                 removed += res.unique;
-                let res = Votes::<T>::clear(u32::max_value(), None);
+                let res = Votes::<T>::clear(u32::MAX, None);
                 removed += res.unique;
                 weight.saturating_accrue(DbWeight::get().reads_writes(removed as _, removed as _));
             }
@@ -222,7 +226,13 @@ pub mod pallet {
         /// * `sigs_required` - Number of sigs required to process a multi-sig tx.
         /// * `permissions` - optional custom permissions.  Only the primary key can provide custom permissions.
         #[pallet::call_index(0)]
-        #[pallet::weight(<T as Config>::WeightInfo::create_multisig(signers.len() as u32))]
+        #[pallet::weight(
+            match permissions.as_ref() {
+                Some(perms) => <T as Config>::WeightInfo::create_multisig(signers.len() as u32)
+                    .saturating_add(<T as IdentityConfig>::WeightInfo::permissions_cost_perms(perms)),
+                None => <T as Config>::WeightInfo::create_multisig(signers.len() as u32),
+            }
+        )]
         pub fn create_multisig(
             origin: OriginFor<T>,
             signers: BoundedVec<T::AccountId, T::MaxSigners>,
@@ -1000,6 +1010,8 @@ impl<T: Config> Pallet<T> {
         sigs_required: u64,
         permissions: Permissions,
     ) -> DispatchResult {
+        IdentityPallet::<T>::ensure_perms_length_limited(&permissions)?;
+
         // Generate new MultiSig address.
         let new_nonce = MultiSigNonce::<T>::get()
             .checked_add(1)
@@ -1104,22 +1116,25 @@ impl<T: Config> Pallet<T> {
         caller_did: Option<IdentityId>,
         max_weight: Weight,
     ) -> DispatchResultWithPostInfo {
-        // emit proposal approved event
-        Self::deposit_event(Event::ProposalApproved {
-            caller_did,
-            multisig: multisig.clone(),
-            proposal_id,
-        });
         // Take the proposal.
         let proposal = Proposals::<T>::take(multisig, proposal_id)
             .ok_or_else(|| Error::<T>::ProposalMissing)?;
 
         // Ensure `max_weight` was enough to cover the worst-case weight.
+        // The proposal has already been loaded, so charge for decoding it.
         let proposal_weight = proposal.get_dispatch_info().call_weight;
-        ensure!(
-            proposal_weight.all_lte(max_weight),
-            Error::<T>::MaxWeightTooLow
-        );
+        if !proposal_weight.all_lte(max_weight) {
+            return Err(DispatchErrorWithPostInfo {
+                post_info: Some(<T as Config>::WeightInfo::decode_proposal()).into(),
+                error: Error::<T>::MaxWeightTooLow.into(),
+            });
+        }
+
+        Self::deposit_event(Event::ProposalApproved {
+            caller_did,
+            multisig: multisig.clone(),
+            proposal_id,
+        });
 
         let (result, actual_weight) =
             match with_call_metadata::<T, _>(proposal.get_call_metadata(), || {
